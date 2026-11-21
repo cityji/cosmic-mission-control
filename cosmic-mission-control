@@ -5,6 +5,7 @@
     down        close the overview, or open the App Library from the desktop
     left/right  inside the overview: switch workspace, overview stays open
                 on the desktop: left to COSMIC, which already handles it
+    3 fingers   drag: move three fingers to hold the left button (macOS three-finger drag)
 
 Design
   * One process, one GLib main loop. No threads, no helper processes per gesture.
@@ -27,7 +28,7 @@ import time
 from collections import deque
 from pathlib import Path
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 
 
 def _env(name, default):
@@ -43,6 +44,10 @@ FLICK_MIN = _env("CMC_FLICK_MIN", 18)      # a fast vertical flick may fire afte
 FLICK_SPEED = _env("CMC_FLICK_SPEED", 300)  # ...if it moves at least this fast (units/s)
 DOMINANCE = _env("CMC_DOMINANCE", 1.3)     # main axis must beat the other by this factor
 SWITCH_GAP = _env("CMC_SWITCH_GAP", 0.3)   # minimum seconds between workspace steps
+DRAG = os.environ.get("CMC_THREE_FINGER_DRAG", "1") != "0"   # three-finger drag on/off
+DRAG_GRACE = _env("CMC_DRAG_GRACE", 0.35)  # seconds the drag survives lifted fingers (0 = drop at once)
+DRAG_START = _env("CMC_DRAG_START", 3)     # travel before the button goes down (about mm)
+DRAG_DELAY = _env("CMC_DRAG_DELAY", 0.04)  # and at least this long, so a 4-finger landing never clicks
 RESHOW_WINDOW = 0.6                        # re-show the overview if it hides this soon after a step
 
 LOG_PATH = Path.home() / ".cache/cosmic-mission-control.log"
@@ -97,10 +102,10 @@ def parse(line):
 
 
 class Detector:
-    """Accumulates one four-finger gesture and fires a direction at most once."""
+    """Routes gestures: four fingers fire a direction at most once, three fingers drag."""
 
-    def __init__(self, on_direction):
-        self.on_direction = on_direction
+    def __init__(self, on_direction, drag=None):
+        self.on_direction, self.drag = on_direction, drag
         self._reset("swipe", 0.0)
 
     def _reset(self, kind, t):
@@ -109,8 +114,17 @@ class Detector:
     def feed(self, line):
         ev = parse(line)
         if not ev:
+            if self.drag and ("POINTER_MOTION" in line or "POINTER_BUTTON" in line):
+                self.drag.touch()              # one-finger use of the touchpad ends a pending drag
+            return
+        if self.drag and ev["fingers"] == 3:
+            {"BEGIN": lambda: self.drag.begin(ev["t"]),
+             "UPDATE": lambda: self.drag.move(ev["dx"], ev["dy"], ev["t"]),
+             "END": lambda: self.drag.end(ev["t"])}[ev["phase"]]()
             return
         if ev["phase"] == "BEGIN":
+            if self.drag:
+                self.drag.touch()              # a four-finger gesture drops any pending drag
             self._reset(ev["kind"], ev["t"])
         elif ev["phase"] == "UPDATE" and ev["fingers"] == 4 and self.result is None:
             self.t = ev["t"]
@@ -135,6 +149,118 @@ class Detector:
         elif ax > DOMINANCE * ay and self._ready(ax, FIRE_H, flick=False):
             # sideways stays deliberate: a workspace step should never feel twitchy
             self.result = self.on_direction("right" if self.dx > 0 else "left")
+
+
+class Dragger:
+    """macOS three-finger drag: three fingers moving = left button held.
+
+    idle -> armed      three fingers touch
+    armed -> dragging  they travel DRAG_START for DRAG_DELAY: button down at the spot
+                       where the fingers landed, then the buffered motion replays
+    dragging -> grace  fingers lift: the drag survives DRAG_GRACE seconds so you can
+                       reposition and continue, exactly like a Mac
+    grace -> dragging  three fingers return in time
+    grace -> idle      timeout, a one-finger touch, a click or a four-finger gesture: drop
+    """
+
+    def __init__(self, pointer, later, cancel):
+        self.p, self.later, self.cancel = pointer, later, cancel
+        self.state, self.timer, self.buf = "idle", None, []
+        self.fx = self.fy = 0.0
+        self.t0 = self.travel = self.moved = 0.0
+        self.started = 0.0
+
+    def begin(self, t):
+        if self.state == "grace":
+            self._stop_timer()
+            self.state = "dragging"
+            return
+        if self.state == "dragging":
+            return
+        self.state, self.t0, self.travel, self.buf = "armed", t, 0.0, []
+
+    def move(self, dx, dy, t):
+        if self.state == "armed":
+            self.buf.append((dx, dy))
+            self.travel += (dx * dx + dy * dy) ** 0.5
+            if self.travel >= DRAG_START and t - self.t0 >= DRAG_DELAY:
+                self.p.press()
+                self.state, self.started, self.moved = "dragging", t, 0.0
+                for bx, by in self.buf:
+                    self._emit(bx, by)
+                self.buf = []
+        elif self.state == "dragging":
+            self._emit(dx, dy)
+
+    def end(self, t):
+        if self.state == "armed":
+            self.state, self.buf = "idle", []     # a rest or a tap, not a drag
+        elif self.state == "dragging":
+            if DRAG_GRACE <= 0:
+                self._drop()
+            else:
+                self.state = "grace"
+                self.timer = self.later(int(DRAG_GRACE * 1000), self._drop)
+
+    def touch(self):
+        if self.state in ("grace", "dragging"):
+            self._drop()
+
+    def _emit(self, dx, dy):
+        self.fx += dx
+        self.fy += dy
+        ix, iy = int(self.fx), int(self.fy)       # keep sub-pixel remainders: no drift, no stutter
+        if ix or iy:
+            self.fx -= ix
+            self.fy -= iy
+            self.moved += abs(ix) + abs(iy)
+            self.p.move(ix, iy)
+
+    def _stop_timer(self):
+        if self.timer is not None:
+            self.cancel(self.timer)
+            self.timer = None
+
+    def _drop(self):
+        self._stop_timer()
+        if self.state in ("grace", "dragging"):
+            self.p.release()
+            log(f"three-finger drag: {self.moved:.0f} px")
+        self.state, self.fx, self.fy = "idle", 0.0, 0.0
+        return False
+
+
+class VirtualPointer:
+    """A uinput mouse. COSMIC is told to apply flat acceleration to it, so motion keeps
+    the touchpad's own acceleration and never gets accelerated twice."""
+    NAME = "cosmic-mission-control pointer"
+
+    def __init__(self):
+        from evdev import UInput, ecodes as e
+        self.e = e
+        self.ui = UInput({e.EV_KEY: [e.BTN_LEFT, e.BTN_RIGHT, e.BTN_MIDDLE],
+                          e.EV_REL: [e.REL_X, e.REL_Y]}, name=self.NAME)
+        self.down = False
+
+    def move(self, dx, dy):
+        self.ui.write(self.e.EV_REL, self.e.REL_X, dx)
+        self.ui.write(self.e.EV_REL, self.e.REL_Y, dy)
+        self.ui.syn()
+
+    def press(self):
+        self.ui.write(self.e.EV_KEY, self.e.BTN_LEFT, 1)
+        self.ui.syn()
+        self.down = True
+
+    def release(self):
+        if self.down:
+            self.ui.write(self.e.EV_KEY, self.e.BTN_LEFT, 0)
+            self.ui.syn()
+            self.down = False
+
+    def close(self):
+        self.release()
+        self.ui.close()
 
 
 # --------------------------------------------------------------------------- actions
@@ -306,13 +432,51 @@ def run_live(dry_run):
     from gi.repository import GLib
     bus = SimBus() if dry_run else OverviewBus()
     run = (lambda *c: log("dry-run: " + " ".join(c))) if dry_run else spawn
-    reader = Reader(Detector(Controller(bus, run)), GLib)
+    pointer = drag = None
+    if DRAG:
+        try:
+            pointer = LogPointer() if dry_run else VirtualPointer()
+            drag = Dragger(pointer, later=lambda ms, fn: GLib.timeout_add(ms, fn), cancel=GLib.source_remove)
+        except Exception as e:                     # python3-evdev missing or no /dev/uinput access
+            log(f"three-finger drag unavailable: {e}")
+    reader = Reader(Detector(Controller(bus, run), drag), GLib)
     loop = GLib.MainLoop()
+
+    def quit_(*_):
+        reader.stop()
+        if pointer:
+            pointer.close()                        # never leave the button held
+        loop.quit()
+        return False
+
     for sig in (signal.SIGTERM, signal.SIGINT):
-        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, sig, lambda *_: (reader.stop(), loop.quit()) and False)
-    log(f"cosmic-mission-control {VERSION} started{' (dry run)' if dry_run else ''}")
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, sig, quit_)
+    log(f"cosmic-mission-control {VERSION} started"
+        f"{', three-finger drag on' if drag else ''}{' (dry run)' if dry_run else ''}")
     reader.start()
     loop.run()
+
+
+class LogPointer:
+    """Pointer stand-in for --dry-run and tests: records what would be sent."""
+
+    def __init__(self):
+        self.events, self.down = [], False
+
+    def move(self, dx, dy):
+        self.events.append(("move", dx, dy))
+
+    def press(self):
+        self.down = True
+        self.events.append(("press",))
+
+    def release(self):
+        if self.down:
+            self.down = False
+            self.events.append(("release",))
+
+    def close(self):
+        self.release()
 
 
 def run_replay(path):

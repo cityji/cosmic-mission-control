@@ -1,6 +1,7 @@
 # cosmic-mission-control
 
-macOS-style four-finger gestures for the [COSMIC](https://system76.com/cosmic) desktop.
+macOS-style touchpad gestures for the [COSMIC](https://system76.com/cosmic) desktop:
+Mission Control on four fingers, and three-finger drag.
 
 COSMIC handles four-finger left/right on its own, but up and down do nothing, and
 gestures stop working while the Workspaces Overview is open. This fills both gaps.
@@ -10,6 +11,20 @@ gestures stop working while the Workspaces Overview is open. This fills both gap
 | 4 fingers up | Open the Workspaces Overview | Nothing (already open) |
 | 4 fingers down | Open the App Library | Close the overview |
 | 4 fingers left / right | Switch workspace (COSMIC's own) | Switch workspace, overview stays open |
+| 3 fingers, move | Drag: windows, text selections, files | |
+
+### Three-finger drag
+
+The macOS accessibility favourite. Rest three fingers and move: it behaves exactly like
+holding the button down, so you can move windows, select text and drag files without pressing.
+
+* **Same speed as your cursor.** Motion goes through a virtual pointer that COSMIC is told
+  not to accelerate again, so a drag tracks your fingers exactly like normal pointing.
+* **Lift and continue.** After you lift, the drag waits 0.35 s. Put three fingers back and
+  keep going, the way a Mac lets you cross a large screen in two strokes. Otherwise it drops.
+* **No accidental clicks.** The button only goes down after the fingers actually travel,
+  so resting three fingers, or landing them on the way to a four-finger swipe, never clicks.
+* **Ends cleanly.** A one-finger touch, a click or a four-finger gesture drops a pending drag at once.
 
 ## What makes it feel right
 
@@ -48,6 +63,7 @@ Requires COSMIC Epoch 1 or later. Tested on Pop!_OS 24.04 (cosmic-comp 1.0, cosm
 | Overview | DBus `com.system76.CosmicWorkspaces.Show` / `Hide`, state from its `Shown` / `Hidden` signals |
 | App Library | `cosmic-app-library`, the same command `Super+A` runs |
 | Workspace switch in the overview | COSMIC's `Super+Ctrl+Left/Right` sent through `ydotool`, since COSMIC ignores gestures there |
+| Three-finger drag | A uinput mouse (`python3-evdev`) with flat acceleration set in COSMIC's per-device input config |
 
 ## Tuning
 
@@ -61,6 +77,8 @@ Environment=CMC_FLICK_MIN=18     # a vertical flick may fire after this much tra
 Environment=CMC_FLICK_SPEED=300  # ...if it is at least this fast (units per second)
 Environment=CMC_SWITCH_GAP=0.3   # minimum seconds between workspace steps
 Environment=CMC_DOMINANCE=1.3    # how clearly one direction must win
+Environment=CMC_THREE_FINGER_DRAG=1  # 0 turns three-finger drag off
+Environment=CMC_DRAG_GRACE=0.35  # seconds a lifted drag waits for your fingers (0 = drop at once)
 ```
 
 ## Troubleshooting

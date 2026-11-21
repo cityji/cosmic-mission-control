@@ -144,5 +144,90 @@ class FeelTest(unittest.TestCase):
         self.assertAlmostEqual(h.bus.reshow_until, h.now + cmc.RESHOW_WINDOW)
 
 
+class FakeTimers:
+    def __init__(self):
+        self.pending, self.next = {}, 1
+
+    def later(self, ms, fn):
+        tid, self.next = self.next, self.next + 1
+        self.pending[tid] = fn
+        return tid
+
+    def cancel(self, tid):
+        self.pending.pop(tid, None)
+
+    def fire_all(self):
+        for tid in list(self.pending):
+            self.pending.pop(tid)()
+
+
+class DragHarness:
+    def __init__(self):
+        self.ptr = cmc.LogPointer()
+        self.timers = FakeTimers()
+        self.drag = cmc.Dragger(self.ptr, self.timers.later, self.timers.cancel)
+        self.bus = cmc.SimBus()
+        self.det = cmc.Detector(cmc.Controller(self.bus, run=lambda *c: None), self.drag)
+
+    def gesture(self, dx, dy, fingers=3, **kw):
+        for line in lines(dx, dy, fingers=fingers, **kw):
+            self.det.feed(line)
+
+    def moved(self):
+        return (sum(e[1] for e in self.ptr.events if e[0] == "move"),
+                sum(e[2] for e in self.ptr.events if e[0] == "move"))
+
+    def kinds(self):
+        return [e[0] for e in self.ptr.events if e[0] != "move"]
+
+
+class DragTest(unittest.TestCase):
+    def test_drag_presses_moves_and_drops_after_grace(self):
+        h = DragHarness()
+        h.gesture(120, -40)
+        self.assertEqual(h.kinds(), ["press"])          # still held during the grace period
+        self.assertEqual(h.moved(), (120, -40))         # every bit of motion, buffered start included
+        h.timers.fire_all()
+        self.assertEqual(h.kinds(), ["press", "release"])
+
+    def test_fingers_back_within_grace_continue_the_same_drag(self):
+        h = DragHarness()
+        h.gesture(100, 0)
+        h.gesture(50, 0)                                # repositioned fingers
+        h.timers.fire_all()
+        self.assertEqual(h.kinds(), ["press", "release"])
+        self.assertEqual(h.moved(), (150, 0))
+
+    def test_resting_fingers_or_tiny_touch_never_click(self):
+        h = DragHarness()
+        h.gesture(1.5, 0.5)
+        h.timers.fire_all()
+        self.assertEqual(h.ptr.events, [])
+
+    def test_one_finger_touch_drops_immediately(self):
+        h = DragHarness()
+        h.gesture(80, 0)
+        h.det.feed(" event4   POINTER_MOTION   +9.000s\t  1.00/  0.00 ( 1.00/ 0.00 unaccelerated)")
+        self.assertEqual(h.kinds(), ["press", "release"])
+        self.assertEqual(h.timers.pending, {})
+
+    def test_four_finger_gesture_drops_a_pending_drag(self):
+        h = DragHarness()
+        h.gesture(80, 0)
+        h.gesture(0, -50, fingers=4)
+        self.assertEqual(h.kinds(), ["press", "release"])
+        self.assertEqual(h.bus.calls, ["Show"])
+
+    def test_sub_pixel_motion_is_not_lost(self):
+        h = DragHarness()
+        h.gesture(10.5, 0, steps=30)                    # 0.35 px per event
+        self.assertEqual(h.moved()[0], 10)
+
+    def test_four_fingers_never_drag(self):
+        h = DragHarness()
+        h.gesture(0, -50, fingers=4)
+        self.assertEqual(h.ptr.events, [])
+
+
 if __name__ == "__main__":
     unittest.main()
