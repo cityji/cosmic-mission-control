@@ -161,17 +161,27 @@ class FakeTimers:
             self.pending.pop(tid)()
 
 
+MM = 31.0                                    # raw touchpad units per mm on the reference pad
+
+
 class DragHarness:
     def __init__(self):
         self.ptr = cmc.LogPointer()
         self.timers = FakeTimers()
-        self.drag = cmc.Dragger(self.ptr, self.timers.later, self.timers.cancel)
-        self.bus = cmc.SimBus()
-        self.det = cmc.Detector(cmc.Controller(self.bus, run=lambda *c: None), self.drag)
+        self.curve = cmc.PointerCurve(persist=False)
+        self.drag = cmc.Dragger(self.ptr, self.curve, self.timers.later, self.timers.cancel, MM)
+        self.t = 10.0
 
-    def gesture(self, dx, dy, fingers=3, **kw):
-        for line in lines(dx, dy, fingers=fingers, **kw):
-            self.det.feed(line)
+    def frames(self, count, dx_mm=0.0, dy_mm=0.0, n=1, hz=125):
+        for _ in range(n):
+            self.t += 1 / hz
+            self.drag.frame(count, dx_mm * MM / n, dy_mm * MM / n, self.t)
+
+    def stroke(self, dx_mm, dy_mm, seconds=0.3, lift=True):
+        self.frames(3)                                         # fingers land
+        self.frames(3, dx_mm, dy_mm, n=max(int(seconds * 125), 1))
+        if lift:
+            self.frames(0)
 
     def moved(self):
         return (sum(e[1] for e in self.ptr.events if e[0] == "move"),
@@ -182,51 +192,92 @@ class DragHarness:
 
 
 class DragTest(unittest.TestCase):
-    def test_drag_presses_moves_and_drops_after_grace(self):
+    def test_press_hold_during_grace_then_release(self):
         h = DragHarness()
-        h.gesture(120, -40)
-        self.assertEqual(h.kinds(), ["press"])          # still held during the grace period
-        self.assertEqual(h.moved(), (120, -40))         # every bit of motion, buffered start included
+        h.stroke(30, 0)
+        self.assertEqual(h.kinds(), ["press"])
         h.timers.fire_all()
         self.assertEqual(h.kinds(), ["press", "release"])
 
-    def test_fingers_back_within_grace_continue_the_same_drag(self):
+    def test_drag_matches_one_finger_pointer_distance(self):
         h = DragHarness()
-        h.gesture(100, 0)
-        h.gesture(50, 0)                                # repositioned fingers
+        h.stroke(40, 0, seconds=0.5)                           # 80 mm/s: ordinary pointing speed
+        speed = 40 * MM / 500                                  # raw units per ms
+        expected = 40 * MM * h.curve.gain(speed)
+        self.assertAlmostEqual(h.moved()[0], expected, delta=expected * 0.03)
+
+    def test_no_motion_is_lost_at_the_start(self):
+        h = DragHarness()
+        h.frames(3)
+        h.frames(3, 0.7, 0, n=2)                               # below the start threshold...
+        self.assertEqual(h.ptr.events, [])
+        h.frames(3, 20, 0, n=40)                               # ...then the real drag
+        total_mm = 20.7
+        self.assertGreater(h.moved()[0], total_mm * MM * 0.33 * 0.95)
+
+    def test_lift_and_continue_is_one_drag(self):
+        h = DragHarness()
+        h.stroke(20, 0)
+        h.stroke(20, 0)
         h.timers.fire_all()
         self.assertEqual(h.kinds(), ["press", "release"])
-        self.assertEqual(h.moved(), (150, 0))
 
-    def test_resting_fingers_or_tiny_touch_never_click(self):
+    def test_resting_fingers_and_taps_never_click(self):
         h = DragHarness()
-        h.gesture(1.5, 0.5)
+        h.frames(3, 0.3, 0, n=20)
+        h.frames(0)
         h.timers.fire_all()
         self.assertEqual(h.ptr.events, [])
 
-    def test_one_finger_touch_drops_immediately(self):
+    def test_four_fingers_never_click_and_block_until_lift(self):
         h = DragHarness()
-        h.gesture(80, 0)
-        h.det.feed(" event4   POINTER_MOTION   +9.000s\t  1.00/  0.00 ( 1.00/ 0.00 unaccelerated)")
+        h.frames(3)                                            # third finger first...
+        h.frames(4, 10, 0, n=10)                               # ...fourth lands: a swipe
+        h.frames(3, 10, 0, n=10)                               # one lifts early
+        h.frames(0)
+        self.assertEqual(h.ptr.events, [])
+
+    def test_fourth_finger_drops_a_drag(self):
+        h = DragHarness()
+        h.stroke(20, 0, lift=False)
+        h.frames(4)
+        self.assertEqual(h.kinds(), ["press", "release"])
+
+    def test_pointing_during_grace_drops(self):
+        h = DragHarness()
+        h.stroke(20, 0)
+        h.frames(1, 3, 0, n=5)
+        self.assertEqual(h.kinds(), ["press", "release"])
+
+    def test_click_drops_immediately(self):
+        h = DragHarness()
+        h.stroke(20, 0)
+        h.drag.touch()
         self.assertEqual(h.kinds(), ["press", "release"])
         self.assertEqual(h.timers.pending, {})
 
-    def test_four_finger_gesture_drops_a_pending_drag(self):
-        h = DragHarness()
-        h.gesture(80, 0)
-        h.gesture(0, -50, fingers=4)
-        self.assertEqual(h.kinds(), ["press", "release"])
-        self.assertEqual(h.bus.calls, ["Show"])
-
     def test_sub_pixel_motion_is_not_lost(self):
         h = DragHarness()
-        h.gesture(10.5, 0, steps=30)                    # 0.35 px per event
-        self.assertEqual(h.moved()[0], 10)
+        h.frames(3)
+        h.frames(3, 30, 0, n=300)                              # ~0.1 mm per frame
+        self.assertGreater(h.moved()[0], 0)
+        expected = 30 * MM * h.curve.gain(30 * MM / 2400)
+        self.assertAlmostEqual(h.moved()[0], expected, delta=3)
 
-    def test_four_fingers_never_drag(self):
-        h = DragHarness()
-        h.gesture(0, -50, fingers=4)
-        self.assertEqual(h.ptr.events, [])
+
+class CurveTest(unittest.TestCase):
+    def test_learns_from_pointer_motion(self):
+        c = cmc.PointerCurve(persist=False)
+        t = 1.0
+        for _ in range(300):                                   # pointer reports 0.5 px per unit at 1 u/ms
+            t += 0.008
+            c.observe(f" event4   POINTER_MOTION   +{t:.3f}s\t  4.00/  0.00 ( 8.00/ +0.00)")
+        self.assertAlmostEqual(c.gain(1.0), 0.5, delta=0.03)
+
+    def test_seed_is_monotonic_enough(self):
+        c = cmc.PointerCurve(persist=False)
+        self.assertLess(c.gain(0.03), c.gain(1.0))
+        self.assertLess(c.gain(1.0), c.gain(10.0))
 
 
 if __name__ == "__main__":

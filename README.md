@@ -18,8 +18,13 @@ gestures stop working while the Workspaces Overview is open. This fills both gap
 The macOS accessibility favourite. Rest three fingers and move: it behaves exactly like
 holding the button down, so you can move windows, select text and drag files without pressing.
 
-* **Same speed as your cursor.** Motion goes through a virtual pointer that COSMIC is told
-  not to accelerate again, so a drag tracks your fingers exactly like normal pointing.
+* **Exactly your pointer speed.** libinput barely accelerates multi-finger motion, so a naive
+  drag feels sluggish. Instead, the daemon learns your real pointer acceleration curve from
+  ordinary one-finger movement (your speed setting included) and applies it to the drag.
+  A drag moves the cursor as far as pointing would, at every speed, and follows your
+  settings if you change them.
+* **Immediate.** Fingers are tracked straight from the touchpad's multitouch frames, so the
+  cursor moves from the first frame instead of waiting for libinput to classify the gesture.
 * **Lift and continue.** After you lift, the drag waits 0.35 s. Put three fingers back and
   keep going, the way a Mac lets you cross a large screen in two strokes. Otherwise it drops.
 * **No accidental clicks.** The button only goes down after the fingers actually travel,
@@ -63,7 +68,7 @@ Requires COSMIC Epoch 1 or later. Tested on Pop!_OS 24.04 (cosmic-comp 1.0, cosm
 | Overview | DBus `com.system76.CosmicWorkspaces.Show` / `Hide`, state from its `Shown` / `Hidden` signals |
 | App Library | `cosmic-app-library`, the same command `Super+A` runs |
 | Workspace switch in the overview | COSMIC's `Super+Ctrl+Left/Right` sent through `ydotool`, since COSMIC ignores gestures there |
-| Three-finger drag | A uinput mouse (`python3-evdev`) with flat acceleration set in COSMIC's per-device input config |
+| Three-finger drag | Raw multitouch frames from the touchpad (`python3-evdev`), your learned pointer curve, and a uinput mouse with flat acceleration in COSMIC's per-device input config |
 
 ## Tuning
 

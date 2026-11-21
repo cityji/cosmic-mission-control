@@ -19,6 +19,7 @@ Design
 Log: ~/.cache/cosmic-mission-control.log
 """
 import argparse
+import math
 import os
 import re
 import signal
@@ -28,7 +29,7 @@ import time
 from collections import deque
 from pathlib import Path
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 
 
 def _env(name, default):
@@ -46,12 +47,13 @@ DOMINANCE = _env("CMC_DOMINANCE", 1.3)     # main axis must beat the other by th
 SWITCH_GAP = _env("CMC_SWITCH_GAP", 0.3)   # minimum seconds between workspace steps
 DRAG = os.environ.get("CMC_THREE_FINGER_DRAG", "1") != "0"   # three-finger drag on/off
 DRAG_GRACE = _env("CMC_DRAG_GRACE", 0.35)  # seconds the drag survives lifted fingers (0 = drop at once)
-DRAG_START = _env("CMC_DRAG_START", 3)     # travel before the button goes down (about mm)
-DRAG_DELAY = _env("CMC_DRAG_DELAY", 0.04)  # and at least this long, so a 4-finger landing never clicks
+DRAG_START = _env("CMC_DRAG_START", 0.8)   # finger travel before the button goes down (mm)
+DRAG_DELAY = _env("CMC_DRAG_DELAY", 0.03)  # and at least this long, so a 4-finger landing never clicks
 RESHOW_WINDOW = 0.6                        # re-show the overview if it hides this soon after a step
 
 LOG_PATH = Path.home() / ".cache/cosmic-mission-control.log"
 NUM = re.compile(r"(-?\d+\.\d+)/\s*(-?\d+\.\d+)")
+MOTION = re.compile(r"(-?\d+\.\d+)/\s*([-+]?\d+\.\d+)\s*\(\s*([-+]?\d+\.\d+)/\s*([-+]?\d+\.\d+)")
 
 
 class Log:
@@ -102,10 +104,12 @@ def parse(line):
 
 
 class Detector:
-    """Routes gestures: four fingers fire a direction at most once, three fingers drag."""
+    """Four-finger gestures from libinput fire a direction at most once. The same stream
+    teaches the pointer curve (one-finger motion) and lets a click end a drag.
+    Three-finger drag itself runs on raw touchpad frames (RawTouch), not on this stream."""
 
-    def __init__(self, on_direction, drag=None):
-        self.on_direction, self.drag = on_direction, drag
+    def __init__(self, on_direction, drag=None, curve=None):
+        self.on_direction, self.drag, self.curve = on_direction, drag, curve
         self._reset("swipe", 0.0)
 
     def _reset(self, kind, t):
@@ -114,17 +118,12 @@ class Detector:
     def feed(self, line):
         ev = parse(line)
         if not ev:
-            if self.drag and ("POINTER_MOTION" in line or "POINTER_BUTTON" in line):
-                self.drag.touch()              # one-finger use of the touchpad ends a pending drag
-            return
-        if self.drag and ev["fingers"] == 3:
-            {"BEGIN": lambda: self.drag.begin(ev["t"]),
-             "UPDATE": lambda: self.drag.move(ev["dx"], ev["dy"], ev["t"]),
-             "END": lambda: self.drag.end(ev["t"])}[ev["phase"]]()
+            if self.curve and "POINTER_MOTION" in line:
+                self.curve.observe(line)
+            elif self.drag and "POINTER_BUTTON" in line and "pressed" in line:
+                self.drag.touch()
             return
         if ev["phase"] == "BEGIN":
-            if self.drag:
-                self.drag.touch()              # a four-finger gesture drops any pending drag
             self._reset(ev["kind"], ev["t"])
         elif ev["phase"] == "UPDATE" and ev["fingers"] == 4 and self.result is None:
             self.t = ev["t"]
@@ -151,69 +150,171 @@ class Detector:
             self.result = self.on_direction("right" if self.dx > 0 else "left")
 
 
-class Dragger:
-    """macOS three-finger drag: three fingers moving = left button held.
+class PointerCurve:
+    """Your pointer's acceleration, learned from normal one-finger movement.
 
-    idle -> armed      three fingers touch
-    armed -> dragging  they travel DRAG_START for DRAG_DELAY: button down at the spot
-                       where the fingers landed, then the buffered motion replays
-    dragging -> grace  fingers lift: the drag survives DRAG_GRACE seconds so you can
-                       reposition and continue, exactly like a Mac
+    libinput reports every pointer motion with both its accelerated (pixels) and raw
+    (touchpad units) delta. Their ratio at each finger speed is your exact pointer curve,
+    including your speed setting. Three-finger drags reuse it, so a drag moves the cursor
+    exactly as far as pointing would. Learned values persist across restarts.
+    """
+    # Seed: measured on a GXTP7863 touchpad at COSMIC speed 0.36 (speed in raw units/ms, px per unit)
+    SEED = [(0.03, 0.183), (0.065, 0.218), (0.14, 0.293), (0.27, 0.333), (0.52, 0.339),
+            (0.95, 0.339), (1.85, 0.339), (3.6, 0.346), (6.5, 0.461), (13.0, 0.55)]
+    PATH = Path.home() / ".cache/cosmic-mission-control-curve.json"
+
+    def __init__(self, path=None, persist=True):
+        import json
+        self.json, self.path, self.persist = json, path or self.PATH, persist
+        self.points = {self._key(s): [g, 5] for s, g in self.SEED}   # key -> [gain, weight]
+        self.prev_t, self.dirty, self.saved_at = None, False, 0.0
+        if persist:
+            try:
+                for k, (g, w) in self.json.loads(self.path.read_text()).items():
+                    self.points[int(k)] = [g, w]
+            except Exception:
+                pass
+
+    @staticmethod
+    def _key(speed):
+        return int(round(math.log2(max(speed, 0.005) / 0.01) * 2))   # half-octave buckets
+
+    @staticmethod
+    def _speed(key):
+        return 0.01 * 2 ** (key / 2)
+
+    def observe(self, line):
+        """Learn from one libinput POINTER_MOTION line."""
+        parts = line.split()
+        try:
+            i = parts.index("POINTER_MOTION")
+            t = float(parts[i + 1].lstrip("+").rstrip("s"))
+        except (ValueError, IndexError):
+            return
+        m = MOTION.search(line)
+        dt, self.prev_t = (t - self.prev_t) if self.prev_t else 0.0, t
+        if not m or not 0.002 < dt < 0.03:
+            return
+        ax, ay, ux, uy = map(float, m.groups())
+        raw = math.hypot(ux, uy)
+        if raw < 1:
+            return
+        k = self._key(raw / (dt * 1000))
+        g, w = self.points.get(k, [math.hypot(ax, ay) / raw, 0])
+        w = min(w + 1, 200)
+        self.points[k] = [g + (math.hypot(ax, ay) / raw - g) / w, w]
+        self.dirty = True
+        if self.persist and t - self.saved_at > 30:
+            self.save(t)
+
+    def save(self, t=0.0):
+        if self.dirty:
+            try:
+                self.path.write_text(self.json.dumps({str(k): v for k, v in self.points.items()}))
+            except OSError:
+                pass
+            self.dirty, self.saved_at = False, t
+
+    def gain(self, speed):
+        """Pixels per raw touchpad unit at this finger speed (raw units per ms)."""
+        pts = sorted((self._speed(k), g) for k, (g, w) in self.points.items() if w >= 3)
+        if speed <= pts[0][0]:
+            return pts[0][1]
+        for (s0, g0), (s1, g1) in zip(pts, pts[1:]):
+            if speed <= s1:
+                f = (math.log(speed) - math.log(s0)) / (math.log(s1) - math.log(s0))
+                return g0 + (g1 - g0) * f
+        return pts[-1][1]
+
+
+class Dragger:
+    """macOS three-finger drag, fed raw touchpad frames (finger count, centroid motion).
+
+    idle -> armed      exactly three fingers touch
+    armed -> dragging  they travel DRAG_START mm for DRAG_DELAY s: button down where they
+                       landed, buffered motion replays, nothing is lost
+    dragging -> grace  fingers lift: the drag survives DRAG_GRACE s so you can reposition
     grace -> dragging  three fingers return in time
-    grace -> idle      timeout, a one-finger touch, a click or a four-finger gesture: drop
+    any -> idle        timeout, a click, or a fourth finger (which also blocks re-arming
+                       until every finger lifts, so four-finger swipes never click)
     """
 
-    def __init__(self, pointer, later, cancel):
-        self.p, self.later, self.cancel = pointer, later, cancel
-        self.state, self.timer, self.buf = "idle", None, []
-        self.fx = self.fy = 0.0
-        self.t0 = self.travel = self.moved = 0.0
-        self.started = 0.0
+    def __init__(self, pointer, curve, later, cancel, units_per_mm=31.0):
+        self.p, self.curve, self.later, self.cancel = pointer, curve, later, cancel
+        self.mm = units_per_mm
+        self.state, self.locked, self.timer, self.buf = "idle", False, None, []
+        self.fx = self.fy = self.speed = 0.0
+        self.t0 = self.travel = self.moved = self.finger_mm = self.stray = 0.0
+        self.last_t = None
 
-    def begin(self, t):
-        if self.state == "grace":
-            self._stop_timer()
-            self.state = "dragging"
-            return
-        if self.state == "dragging":
-            return
-        self.state, self.t0, self.travel, self.buf = "armed", t, 0.0, []
-
-    def move(self, dx, dy, t):
-        if self.state == "armed":
-            self.buf.append((dx, dy))
-            self.travel += (dx * dx + dy * dy) ** 0.5
-            if self.travel >= DRAG_START and t - self.t0 >= DRAG_DELAY:
-                self.p.press()
-                self.state, self.started, self.moved = "dragging", t, 0.0
-                for bx, by in self.buf:
-                    self._emit(bx, by)
-                self.buf = []
-        elif self.state == "dragging":
-            self._emit(dx, dy)
-
-    def end(self, t):
-        if self.state == "armed":
-            self.state, self.buf = "idle", []     # a rest or a tap, not a drag
-        elif self.state == "dragging":
-            if DRAG_GRACE <= 0:
+    def frame(self, count, dx, dy, t):
+        dt = t - self.last_t if self.last_t is not None else 0.008
+        self.last_t = t
+        if count == 0:
+            self.locked = False
+        st = self.state
+        if st == "idle":
+            if count == 3 and not self.locked:
+                self.state, self.t0, self.travel, self.buf = "armed", t, 0.0, []
+            elif count >= 4:
+                self.locked = True
+        elif st == "armed":
+            if count >= 4:
+                self.state, self.locked = "idle", True
+            elif count < 3:
+                self.state = "idle"                       # a rest or a three-finger tap
+            else:
+                self.buf.append((dx, dy, dt))
+                self.travel += math.hypot(dx, dy)
+                if self.travel >= DRAG_START * self.mm and t - self.t0 >= DRAG_DELAY:
+                    self.p.press()
+                    self.state, self.moved, self.finger_mm, self.speed = "dragging", 0.0, 0.0, 0.0
+                    for bx, by, bdt in self.buf:
+                        self._emit(bx, by, bdt)
+                    self.buf = []
+        elif st == "dragging":
+            if count == 3:
+                self._emit(dx, dy, dt)
+            elif count >= 4:
+                self._drop()
+                self.locked = True
+            elif DRAG_GRACE <= 0:
                 self._drop()
             else:
-                self.state = "grace"
+                self.state, self.stray = "grace", 0.0
                 self.timer = self.later(int(DRAG_GRACE * 1000), self._drop)
+        elif st == "grace":
+            if count == 3:
+                self._stop_timer()
+                self.state, self.speed = "dragging", 0.0
+            elif count >= 4:
+                self._drop()
+                self.locked = True
+            elif count in (1, 2):
+                self.stray += math.hypot(dx, dy)
+                if self.stray > self.mm:                  # pointing with one or two fingers: drop
+                    self._drop()
 
     def touch(self):
+        """A physical click ends a drag at once."""
         if self.state in ("grace", "dragging"):
             self._drop()
 
-    def _emit(self, dx, dy):
-        self.fx += dx
-        self.fy += dy
-        ix, iy = int(self.fx), int(self.fy)       # keep sub-pixel remainders: no drift, no stutter
+    def _emit(self, dx, dy, dt):
+        dist = math.hypot(dx, dy)
+        if not dist:
+            return
+        self.finger_mm += dist / self.mm
+        v = dist / max(dt * 1000, 1.0)                    # raw units per ms
+        self.speed = v if not self.speed else self.speed * 0.5 + v * 0.5
+        g = self.curve.gain(self.speed)
+        self.fx += dx * g
+        self.fy += dy * g
+        ix, iy = int(self.fx), int(self.fy)               # keep sub-pixel remainders
         if ix or iy:
             self.fx -= ix
             self.fy -= iy
-            self.moved += abs(ix) + abs(iy)
+            self.moved += math.hypot(ix, iy)
             self.p.move(ix, iy)
 
     def _stop_timer(self):
@@ -225,9 +326,64 @@ class Dragger:
         self._stop_timer()
         if self.state in ("grace", "dragging"):
             self.p.release()
-            log(f"three-finger drag: {self.moved:.0f} px")
+            log(f"three-finger drag: {self.finger_mm:.0f} mm of finger travel -> {self.moved:.0f} px")
         self.state, self.fx, self.fy = "idle", 0.0, 0.0
         return False
+
+
+class RawTouch:
+    """Reads the touchpad's raw multitouch frames (alongside libinput, never exclusively)
+    and reports finger count and centroid motion per frame. Palms are ignored."""
+
+    def __init__(self, path, on_frame):
+        from evdev import InputDevice, ecodes as e
+        self.e, self.dev, self.on_frame = e, InputDevice(path), on_frame
+        absinfo = dict(self.dev.capabilities()[e.EV_ABS])
+        self.units_per_mm = float(absinfo[e.ABS_MT_POSITION_X].resolution or 31)
+        self.slots, self.cur, self.prev = {}, 0, {}
+
+    def fileno(self):
+        return self.dev.fd
+
+    def read(self):
+        e = self.e
+        try:
+            events = list(self.dev.read())
+        except BlockingIOError:
+            return True
+        except OSError:
+            return False                                  # device gone (suspend/unplug)
+        for ev in events:
+            if ev.type == e.EV_ABS:
+                if ev.code == e.ABS_MT_SLOT:
+                    self.cur = ev.value
+                elif ev.code == e.ABS_MT_TRACKING_ID:
+                    if ev.value < 0:
+                        self.slots.pop(self.cur, None)
+                    else:
+                        self.slots[self.cur] = {"x": None, "y": None, "palm": False}
+                elif self.cur in self.slots:
+                    s = self.slots[self.cur]
+                    if ev.code == e.ABS_MT_POSITION_X:
+                        s["x"] = ev.value
+                    elif ev.code == e.ABS_MT_POSITION_Y:
+                        s["y"] = ev.value
+                    elif ev.code == e.ABS_MT_TOOL_TYPE:
+                        s["palm"] = ev.value == e.MT_TOOL_PALM
+            elif ev.type == e.EV_SYN and ev.code == e.SYN_REPORT:
+                self._frame(ev.timestamp())
+        return True
+
+    def _frame(self, t):
+        now = {k: (s["x"], s["y"]) for k, s in self.slots.items()
+               if s["x"] is not None and s["y"] is not None and not s["palm"]}
+        both = [k for k in now if k in self.prev]
+        dx = sum(now[k][0] - self.prev[k][0] for k in both) / len(both) if both else 0.0
+        dy = sum(now[k][1] - self.prev[k][1] for k in both) / len(both) if both else 0.0
+        if len(now) != len(self.prev):
+            dx = dy = 0.0                                 # finger landed or lifted: no jump
+        self.prev = now
+        self.on_frame(len(now), dx, dy, t)
 
 
 class VirtualPointer:
@@ -432,20 +588,26 @@ def run_live(dry_run):
     from gi.repository import GLib
     bus = SimBus() if dry_run else OverviewBus()
     run = (lambda *c: log("dry-run: " + " ".join(c))) if dry_run else spawn
-    pointer = drag = None
+    pointer = drag = curve = raw = None
     if DRAG:
         try:
+            curve = PointerCurve()
             pointer = LogPointer() if dry_run else VirtualPointer()
-            drag = Dragger(pointer, later=lambda ms, fn: GLib.timeout_add(ms, fn), cancel=GLib.source_remove)
+            drag = Dragger(pointer, curve, later=lambda ms, fn: GLib.timeout_add(ms, fn),
+                           cancel=GLib.source_remove)
+            raw = RawWatch(drag, GLib)
         except Exception as e:                     # python3-evdev missing or no /dev/uinput access
             log(f"three-finger drag unavailable: {e}")
-    reader = Reader(Detector(Controller(bus, run), drag), GLib)
+            drag = None
+    reader = Reader(Detector(Controller(bus, run), drag, curve), GLib)
     loop = GLib.MainLoop()
 
     def quit_(*_):
         reader.stop()
         if pointer:
             pointer.close()                        # never leave the button held
+        if curve:
+            curve.save()
         loop.quit()
         return False
 
@@ -454,7 +616,34 @@ def run_live(dry_run):
     log(f"cosmic-mission-control {VERSION} started"
         f"{', three-finger drag on' if drag else ''}{' (dry run)' if dry_run else ''}")
     reader.start()
+    if raw:
+        raw.start()
     loop.run()
+
+
+class RawWatch:
+    """Keeps a RawTouch reader attached to the GLib loop; reattaches after suspend or unplug."""
+
+    def __init__(self, drag, GLib):
+        self.drag, self.GLib, self.raw = drag, GLib, None
+
+    def start(self):
+        dev = touchpad()
+        if not dev:
+            self.GLib.timeout_add_seconds(5, lambda: self.start() and False)
+            return
+        self.raw = RawTouch(dev, self.drag.frame)
+        self.drag.mm = self.raw.units_per_mm
+        self.GLib.io_add_watch(self.raw.fileno(), self.GLib.PRIORITY_HIGH,
+                               self.GLib.IO_IN | self.GLib.IO_HUP | self.GLib.IO_ERR, self._on_data)
+
+    def _on_data(self, _fd, cond):
+        if cond & (self.GLib.IO_HUP | self.GLib.IO_ERR) or not self.raw.read():
+            log("raw touchpad reader lost, reattaching")
+            self.drag.touch()
+            self.GLib.timeout_add_seconds(1, lambda: self.start() and False)
+            return False
+        return True
 
 
 class LogPointer:
