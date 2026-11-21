@@ -1,50 +1,146 @@
 #!/usr/bin/env python3
 """cosmic-mission-control: macOS-style four-finger gestures for the COSMIC desktop.
 
-Outside the overview:  up = Workspaces Overview, down = App Library (full app grid),
-                       left/right = left to COSMIC (native workspace switching).
-Inside the overview:   down = close it, left/right = switch workspace, overview stays up.
+    up          open the Workspaces Overview
+    down        close the overview, or open the App Library from the desktop
+    left/right  inside the overview: switch workspace, overview stays open
+                on the desktop: left to COSMIC, which already handles it
 
-The overview is driven through its own DBus API (com.system76.CosmicWorkspaces Show/Hide)
-and its Shown/Hidden signals, so the daemon always knows whether it is really open.
-Actions fire mid-gesture once the motion is clear. Four-finger pinches count as swipes,
-since libinput often classifies a slightly converging four-finger swipe as a pinch.
-Only the touchpad device is read: no keyboard input is ever read.
+Design
+  * One process, one GLib main loop. No threads, no helper processes per gesture.
+  * The overview is driven through its own DBus API (com.system76.CosmicWorkspaces
+    Show / Hide) and its Shown / Hidden signals, so its real state is always known.
+  * Velocity-aware: a quick flick fires after a short distance, a slow swipe needs more.
+  * Four-finger pinches count as swipes: libinput reports a slightly converging
+    four-finger swipe as a pinch.
+  * Only the touchpad is read. Keyboard input is never read.
+
 Log: ~/.cache/cosmic-mission-control.log
 """
+import argparse
 import os
 import re
+import signal
 import subprocess
-import threading
+import sys
 import time
 from collections import deque
 from pathlib import Path
 
-FIRE_V = float(os.environ.get("CMC_FIRE_V", 38))       # vertical travel that triggers (about mm)
-FIRE_H = float(os.environ.get("CMC_FIRE_H", 45))       # horizontal travel for a workspace step
-DOMINANCE = float(os.environ.get("CMC_DOMINANCE", 1.3))  # main axis must beat the other by this
-NUM = re.compile(r"(-?\d+\.\d+)/\s*(-?\d+\.\d+)")
-LOG = Path.home() / ".cache/cosmic-mission-control.log"
-WS_DEST = ["--dest", "com.system76.CosmicWorkspaces", "--object-path", "/com/system76/CosmicWorkspaces"]
-WS_IFACE = "com.system76.CosmicWorkspaces"
-_log = deque(maxlen=400)
+VERSION = "1.1.0"
 
 
-def log(msg):
-    _log.append(time.strftime("%H:%M:%S ") + msg)
+def _env(name, default):
     try:
-        LOG.write_text("\n".join(_log) + "\n")
-    except OSError:
-        pass
+        return float(os.environ.get(name, default))
+    except ValueError:
+        return default
 
+
+FIRE_V = _env("CMC_FIRE_V", 38)            # vertical travel that always fires (about mm)
+FIRE_H = _env("CMC_FIRE_H", 45)            # horizontal travel that always fires
+FLICK_MIN = _env("CMC_FLICK_MIN", 18)      # a fast flick may fire after this much travel...
+FLICK_SPEED = _env("CMC_FLICK_SPEED", 300)  # ...if it moves at least this fast (units/s)
+DOMINANCE = _env("CMC_DOMINANCE", 1.3)     # main axis must beat the other by this factor
+
+LOG_PATH = Path.home() / ".cache/cosmic-mission-control.log"
+NUM = re.compile(r"(-?\d+\.\d+)/\s*(-?\d+\.\d+)")
+
+
+class Log:
+    def __init__(self, path=LOG_PATH, echo=False):
+        self.path, self.echo, self.lines = path, echo, deque(maxlen=400)
+
+    def __call__(self, msg):
+        line = time.strftime("%H:%M:%S ") + msg
+        self.lines.append(line)
+        if self.echo:
+            print(line, flush=True)
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.path.write_text("\n".join(self.lines) + "\n")
+        except OSError:
+            pass
+
+
+log = Log()
+
+
+# --------------------------------------------------------------------------- parsing
+
+def parse(line):
+    """Turn one `libinput debug-events` line into an event dict, or None."""
+    if "GESTURE_SWIPE" in line:
+        kind = "swipe"
+    elif "GESTURE_PINCH" in line:
+        kind = "pinch"
+    else:
+        return None
+    parts = line.split()
+    try:
+        i = next(n for n, p in enumerate(parts) if p.startswith("GESTURE_"))
+        phase = parts[i].rsplit("_", 1)[1]                  # BEGIN / UPDATE / END
+        t = float(parts[i + 1].lstrip("+").rstrip("s"))
+        fingers = int(parts[i + 2])
+    except (StopIteration, IndexError, ValueError):
+        return None
+    ev = {"kind": kind, "phase": phase, "t": t, "fingers": fingers,
+          "dx": 0.0, "dy": 0.0, "cancelled": "cancelled" in line}
+    if phase == "UPDATE":
+        m = NUM.search(" ".join(parts[i + 3:]))           # first pair after the finger count
+        if not m:
+            return None
+        ev["dx"], ev["dy"] = float(m.group(1)), float(m.group(2))
+    return ev
+
+
+class Detector:
+    """Accumulates one four-finger gesture and fires a direction at most once."""
+
+    def __init__(self, on_direction):
+        self.on_direction = on_direction
+        self._reset("swipe", 0.0)
+
+    def _reset(self, kind, t):
+        self.kind, self.t0, self.t, self.dx, self.dy, self.result = kind, t, t, 0.0, 0.0, None
+
+    def feed(self, line):
+        ev = parse(line)
+        if not ev:
+            return
+        if ev["phase"] == "BEGIN":
+            self._reset(ev["kind"], ev["t"])
+        elif ev["phase"] == "UPDATE" and ev["fingers"] == 4 and self.result is None:
+            self.t = ev["t"]
+            self.dx += ev["dx"]
+            self.dy += ev["dy"]
+            self._check()
+        elif ev["phase"] == "END" and ev["fingers"] == 4:
+            ms = (ev["t"] - self.t0) * 1000
+            log(f"{self.kind} dx={self.dx:+.0f} dy={self.dy:+.0f} {ms:.0f}ms"
+                f"{' cancelled' if ev['cancelled'] else ''} -> {self.result or 'no action'}")
+
+    def _ready(self, dist, threshold):
+        speed = dist / max(self.t - self.t0, 1e-3)
+        return dist >= threshold or (dist >= FLICK_MIN and speed >= FLICK_SPEED)
+
+    def _check(self):
+        ax, ay = abs(self.dx), abs(self.dy)
+        if ay > DOMINANCE * ax and self._ready(ay, FIRE_V):
+            self.result = self.on_direction("up" if self.dy < 0 else "down")
+        elif ax > DOMINANCE * ay and self._ready(ax, FIRE_H):
+            self.result = self.on_direction("right" if self.dx > 0 else "left")
+
+
+# --------------------------------------------------------------------------- actions
 
 def session_env():
     """WAYLAND_DISPLAY and the DBus address of the live compositor, read at call time,
-    so a daemon started before the desktop still targets the right session."""
+    so a service that started before the desktop still targets the right session."""
     env = dict(os.environ)
     try:
         pid = subprocess.run(["pidof", "cosmic-comp"], capture_output=True, text=True).stdout.split()[0]
-        for kv in open(f"/proc/{pid}/environ", "rb").read().split(b"\0"):
+        for kv in Path(f"/proc/{pid}/environ").read_bytes().split(b"\0"):
             k, _, v = kv.decode(errors="ignore").partition("=")
             if k in ("WAYLAND_DISPLAY", "DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR", "DISPLAY"):
                 env[k] = v
@@ -58,56 +154,89 @@ def session_env():
 
 def spawn(*cmd):
     try:
-        subprocess.Popen(cmd, env=session_env(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.Popen(cmd, env=session_env(), stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
     except OSError as e:
-        log(f"spawn failed {cmd}: {e}")
+        log(f"could not run {cmd[0]}: {e}")
 
 
-def ws(method, wait=False):
-    """Call Show or Hide on the overview. Idempotent, about 5 ms."""
-    cmd = ["gdbus", "call", "--session", *WS_DEST, "--method", f"{WS_IFACE}.{method}"]
-    if wait:
-        subprocess.run(cmd, env=session_env(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2)
-    else:
-        spawn(*cmd)
-
-
-class Overview:
-    """Tracks real visibility from the overview's Shown/Hidden DBus signals."""
+class OverviewBus:
+    """The Workspaces Overview over DBus: Show/Hide calls, Shown/Hidden signals."""
+    NAME = "com.system76.CosmicWorkspaces"
+    PATH = "/com/system76/CosmicWorkspaces"
 
     def __init__(self):
+        from gi.repository import Gio
+        self.Gio = Gio
+        os.environ.setdefault("DBUS_SESSION_BUS_ADDRESS", session_env()["DBUS_SESSION_BUS_ADDRESS"])
+        self.conn = Gio.bus_get_sync(Gio.BusType.SESSION, None)
         self.shown = False
-        threading.Thread(target=self._watch, daemon=True).start()
+        self.conn.signal_subscribe(None, self.NAME, None, self.PATH, None,
+                                   Gio.DBusSignalFlags.NONE, self._on_signal)
+        Gio.bus_watch_name_on_connection(self.conn, self.NAME, Gio.BusNameWatcherFlags.NONE,
+                                         None, self._on_vanished)
 
-    def _watch(self):
-        while True:  # restart the monitor if the overview process restarts
-            try:
-                p = subprocess.Popen(["gdbus", "monitor", "--session", *WS_DEST], env=session_env(),
-                                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
-                for line in p.stdout:
-                    if f"{WS_IFACE}.Shown" in line:
-                        self.shown = True
-                    elif f"{WS_IFACE}.Hidden" in line:
-                        self.shown = False
-            except OSError as e:
-                log(f"monitor failed: {e}")
-            self.shown = False
-            time.sleep(2)
+    def _on_signal(self, _conn, _sender, _path, _iface, member, _params):
+        if member in ("Shown", "Hidden"):
+            self.shown = member == "Shown"
 
-    def open(self):
-        if self.shown:  # thought to be open but the user swiped up: force it back on screen
-            ws("Hide", wait=True)
-        ws("Show")
+    def _on_vanished(self, *_):
+        self.shown = False          # overview process exited or restarted
+
+    def _call(self, method):
+        self.conn.call(self.NAME, self.PATH, self.NAME, method, None, None,
+                       self.Gio.DBusCallFlags.NONE, 1000, None, None, None)
+
+    def show(self):
+        self._call("Show")
+
+    def hide(self):
+        self._call("Hide")
+
+
+class SimBus:
+    """Stand-in for OverviewBus in --dry-run, --replay and tests."""
+
+    def __init__(self):
+        self.shown, self.calls = False, []
+
+    def show(self):
         self.shown = True
+        self.calls.append("Show")
 
-    def close(self):
-        ws("Hide")
+    def hide(self):
         self.shown = False
+        self.calls.append("Hide")
 
-    def switch(self, direction):
-        spawn("ydotool", "key", f"super+ctrl+{direction}")
-        threading.Timer(0.2, lambda: ws("Show")).start()  # no-op if still open, reopens if not
 
+class Controller:
+    """Maps a direction to an action given whether the overview is open."""
+
+    def __init__(self, bus, run=spawn, later=None):
+        self.bus, self.run, self.later = bus, run, later or (lambda ms, fn: fn())
+
+    def __call__(self, direction):
+        open_ = self.bus.shown
+        if direction == "up":
+            if open_:
+                return "overview already open"
+            self.bus.show()
+            return "show overview"
+        if direction == "down":
+            if open_:
+                self.bus.hide()
+                return "hide overview"
+            self.run("cosmic-app-library")          # what Super+A runs
+            return "app library"
+        if not open_:
+            return "desktop: COSMIC switches workspace"
+        key = "Right" if direction == "right" else "Left"
+        self.run("ydotool", "key", f"super+ctrl+{key}")
+        self.later(200, self.bus.show)              # no-op if still open; restores it if not
+        return f"workspace {direction} in overview"
+
+
+# --------------------------------------------------------------------------- runtime
 
 def touchpad():
     out = subprocess.run(["libinput", "list-devices"], capture_output=True, text=True).stdout
@@ -115,72 +244,81 @@ def touchpad():
     for line in out.splitlines():
         if line.startswith("Device:"):
             dev = line
-        elif line.strip().startswith("Kernel:") and dev and "Touchpad" in dev:
+        elif line.strip().startswith("Kernel:") and dev and "touchpad" in dev.lower():
             return line.split()[-1]
     return None
 
 
-class Gestures:
-    def __init__(self, overview):
-        self.ov = overview
-        self.reset("")
+class Reader:
+    """Runs `libinput debug-events` on the touchpad inside the GLib loop; restarts it on exit."""
 
-    def reset(self, kind):
-        self.kind, self.dx, self.dy, self.action = kind, 0.0, 0.0, None
+    def __init__(self, detector, GLib):
+        self.detector, self.GLib, self.proc, self.buf = detector, GLib, None, b""
 
-    def update(self, fingers, ddx, ddy):
-        if fingers != 4 or self.action:
+    def start(self):
+        dev = touchpad()
+        if not dev:
+            log("no touchpad found, retrying in 5 s")
+            self.GLib.timeout_add_seconds(5, lambda: self.start() and False)
             return
-        self.dx += ddx
-        self.dy += ddy
-        ax, ay = abs(self.dx), abs(self.dy)
-        if ay >= FIRE_V and ay > DOMINANCE * ax:
-            if self.dy < 0:
-                self.action = "up: show overview" + (" (forced)" if self.ov.shown else "")
-                self.ov.open()
-            elif self.ov.shown:
-                self.action = "down: hide overview"
-                self.ov.close()
-            else:
-                self.action = "down: app library"
-                spawn("cosmic-app-library")
-        elif ax >= FIRE_H and ax > DOMINANCE * ay:
-            if self.ov.shown:
-                d = "Right" if self.dx > 0 else "Left"
-                self.action = f"{d.lower()}: workspace in overview"
-                self.ov.switch(d)
-            else:
-                self.action = "left/right on desktop: COSMIC handles it"
+        self.proc = subprocess.Popen(["libinput", "debug-events", "--device", dev],
+                                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        self.buf = b""
+        self.GLib.io_add_watch(self.proc.stdout.fileno(), self.GLib.PRIORITY_HIGH,
+                               self.GLib.IO_IN | self.GLib.IO_HUP | self.GLib.IO_ERR, self._on_data)
+        log(f"reading {dev}")
 
-    def end(self, fingers, cancelled):
-        log(f"{self.kind} {fingers}f dx={self.dx:+.0f} dy={self.dy:+.0f}{' cancelled' if cancelled else ''}"
-            f" overview={'shown' if self.ov.shown else 'hidden'} -> {self.action or 'no action'}")
+    def _on_data(self, fd, cond):
+        data = os.read(fd, 65536) if cond & self.GLib.IO_IN else b""
+        if not data:
+            log("touchpad reader stopped, restarting")
+            self.stop()
+            self.GLib.timeout_add_seconds(1, lambda: self.start() and False)
+            return False
+        self.buf += data
+        *lines, self.buf = self.buf.split(b"\n")
+        for line in lines:
+            self.detector.feed(line.decode(errors="replace"))
+        return True
+
+    def stop(self):
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()
 
 
-def main():
-    dev = touchpad()
-    log(f"start, touchpad={dev}")
-    g = Gestures(Overview())
-    cmd = ["libinput", "debug-events"] + (["--device", dev] if dev else [])
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True, bufsize=1)
-    for line in proc.stdout:
-        kind = "swipe" if "GESTURE_SWIPE" in line else "pinch" if "GESTURE_PINCH" in line else None
-        if not kind:
-            continue
-        parts = line.split()
-        try:
-            fingers = int(parts[3])
-        except (IndexError, ValueError):
-            continue
-        if "_BEGIN" in line:
-            g.reset(kind)
-        elif "_UPDATE" in line:
-            m = NUM.search(line)
-            if m:
-                g.update(fingers, float(m.group(1)), float(m.group(2)))
-        elif "_END" in line:
-            g.end(fingers, "cancelled" in line)
-    log("libinput reader exited; systemd will restart the service")
+def run_live(dry_run):
+    from gi.repository import GLib
+    bus = SimBus() if dry_run else OverviewBus()
+    run = (lambda *c: log("dry-run: " + " ".join(c))) if dry_run else spawn
+    later = lambda ms, fn: GLib.timeout_add(ms, lambda: fn() and False)
+    reader = Reader(Detector(Controller(bus, run, later)), GLib)
+    loop = GLib.MainLoop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, sig, lambda *_: (reader.stop(), loop.quit()) and False)
+    log(f"cosmic-mission-control {VERSION} started{' (dry run)' if dry_run else ''}")
+    reader.start()
+    loop.run()
+
+
+def run_replay(path):
+    log.echo = True
+    bus = SimBus()
+    det = Detector(Controller(bus, run=lambda *c: log("run: " + " ".join(c))))
+    for line in Path(path).read_text().splitlines():
+        det.feed(line)
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="macOS-style four-finger gestures for COSMIC.")
+    ap.add_argument("--dry-run", action="store_true", help="read the touchpad but only log actions")
+    ap.add_argument("--replay", metavar="FILE", help="feed saved `libinput debug-events` output, no touchpad")
+    ap.add_argument("--version", action="version", version=VERSION)
+    args = ap.parse_args(argv)
+    if args.replay:
+        run_replay(args.replay)
+    else:
+        log.echo = sys.stdout.isatty()
+        run_live(args.dry_run)
 
 
 if __name__ == "__main__":
