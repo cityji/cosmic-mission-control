@@ -1,0 +1,12 @@
+[Unit]
+Description=macOS-style four-finger gestures for COSMIC (cosmic-mission-control)
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/bin/cosmic-mission-control
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target default.target
