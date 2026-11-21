@@ -27,7 +27,7 @@ import time
 from collections import deque
 from pathlib import Path
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 
 def _env(name, default):
@@ -38,10 +38,12 @@ def _env(name, default):
 
 
 FIRE_V = _env("CMC_FIRE_V", 38)            # vertical travel that always fires (about mm)
-FIRE_H = _env("CMC_FIRE_H", 45)            # horizontal travel that always fires
-FLICK_MIN = _env("CMC_FLICK_MIN", 18)      # a fast flick may fire after this much travel...
+FIRE_H = _env("CMC_FIRE_H", 40)            # horizontal travel for a workspace step (no flick shortcut)
+FLICK_MIN = _env("CMC_FLICK_MIN", 18)      # a fast vertical flick may fire after this much travel...
 FLICK_SPEED = _env("CMC_FLICK_SPEED", 300)  # ...if it moves at least this fast (units/s)
 DOMINANCE = _env("CMC_DOMINANCE", 1.3)     # main axis must beat the other by this factor
+SWITCH_GAP = _env("CMC_SWITCH_GAP", 0.3)   # minimum seconds between workspace steps
+RESHOW_WINDOW = 0.6                        # re-show the overview if it hides this soon after a step
 
 LOG_PATH = Path.home() / ".cache/cosmic-mission-control.log"
 NUM = re.compile(r"(-?\d+\.\d+)/\s*(-?\d+\.\d+)")
@@ -120,15 +122,18 @@ class Detector:
             log(f"{self.kind} dx={self.dx:+.0f} dy={self.dy:+.0f} {ms:.0f}ms"
                 f"{' cancelled' if ev['cancelled'] else ''} -> {self.result or 'no action'}")
 
-    def _ready(self, dist, threshold):
+    def _ready(self, dist, threshold, flick):
+        if dist >= threshold:
+            return True
         speed = dist / max(self.t - self.t0, 1e-3)
-        return dist >= threshold or (dist >= FLICK_MIN and speed >= FLICK_SPEED)
+        return flick and dist >= FLICK_MIN and speed >= FLICK_SPEED
 
     def _check(self):
         ax, ay = abs(self.dx), abs(self.dy)
-        if ay > DOMINANCE * ax and self._ready(ay, FIRE_V):
+        if ay > DOMINANCE * ax and self._ready(ay, FIRE_V, flick=True):
             self.result = self.on_direction("up" if self.dy < 0 else "down")
-        elif ax > DOMINANCE * ay and self._ready(ax, FIRE_H):
+        elif ax > DOMINANCE * ay and self._ready(ax, FIRE_H, flick=False):
+            # sideways stays deliberate: a workspace step should never feel twitchy
             self.result = self.on_direction("right" if self.dx > 0 else "left")
 
 
@@ -171,14 +176,22 @@ class OverviewBus:
         os.environ.setdefault("DBUS_SESSION_BUS_ADDRESS", session_env()["DBUS_SESSION_BUS_ADDRESS"])
         self.conn = Gio.bus_get_sync(Gio.BusType.SESSION, None)
         self.shown = False
+        self.reshow_until = 0.0     # set right after a workspace step
         self.conn.signal_subscribe(None, self.NAME, None, self.PATH, None,
                                    Gio.DBusSignalFlags.NONE, self._on_signal)
         Gio.bus_watch_name_on_connection(self.conn, self.NAME, Gio.BusNameWatcherFlags.NONE,
                                          None, self._on_vanished)
 
     def _on_signal(self, _conn, _sender, _path, _iface, member, _params):
-        if member in ("Shown", "Hidden"):
-            self.shown = member == "Shown"
+        if member == "Shown":
+            self.shown = True
+        elif member == "Hidden":
+            if time.monotonic() < self.reshow_until:
+                self.reshow_until = 0.0     # COSMIC closed it because of our step: bring it back once
+                self._call("Show")
+                log("overview hid after a workspace step, re-shown")
+                return
+            self.shown = False
 
     def _on_vanished(self, *_):
         self.shown = False          # overview process exited or restarted
@@ -198,7 +211,7 @@ class SimBus:
     """Stand-in for OverviewBus in --dry-run, --replay and tests."""
 
     def __init__(self):
-        self.shown, self.calls = False, []
+        self.shown, self.calls, self.reshow_until = False, [], 0.0
 
     def show(self):
         self.shown = True
@@ -212,8 +225,8 @@ class SimBus:
 class Controller:
     """Maps a direction to an action given whether the overview is open."""
 
-    def __init__(self, bus, run=spawn, later=None):
-        self.bus, self.run, self.later = bus, run, later or (lambda ms, fn: fn())
+    def __init__(self, bus, run=spawn, clock=time.monotonic):
+        self.bus, self.run, self.clock, self.last_step = bus, run, clock, -1e9
 
     def __call__(self, direction):
         open_ = self.bus.shown
@@ -230,9 +243,12 @@ class Controller:
             return "app library"
         if not open_:
             return "desktop: COSMIC switches workspace"
-        key = "Right" if direction == "right" else "Left"
-        self.run("ydotool", "key", f"super+ctrl+{key}")
-        self.later(200, self.bus.show)              # no-op if still open; restores it if not
+        now = self.clock()
+        if now - self.last_step < SWITCH_GAP:
+            return "ignored: too soon after the last step"
+        self.last_step = now
+        self.bus.reshow_until = now + RESHOW_WINDOW
+        self.run("ydotool", "key", f"super+ctrl+{'Right' if direction == 'right' else 'Left'}")
         return f"workspace {direction} in overview"
 
 
@@ -290,8 +306,7 @@ def run_live(dry_run):
     from gi.repository import GLib
     bus = SimBus() if dry_run else OverviewBus()
     run = (lambda *c: log("dry-run: " + " ".join(c))) if dry_run else spawn
-    later = lambda ms, fn: GLib.timeout_add(ms, lambda: fn() and False)
-    reader = Reader(Detector(Controller(bus, run, later)), GLib)
+    reader = Reader(Detector(Controller(bus, run)), GLib)
     loop = GLib.MainLoop()
     for sig in (signal.SIGTERM, signal.SIGINT):
         GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, sig, lambda *_: (reader.stop(), loop.quit()) and False)

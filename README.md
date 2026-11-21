@@ -14,8 +14,10 @@ gestures stop working while the Workspaces Overview is open. This fills both gap
 ## What makes it feel right
 
 * **Responds mid-swipe.** It fires the moment the direction is clear, not when you lift your fingers.
-* **Flick-aware.** A quick flick fires after a short distance; a slow, deliberate swipe needs a
-  little more. Short accidental drags do nothing.
+* **Flick-aware up and down.** A quick vertical flick fires after a short distance; a slow swipe
+  needs a little more. Short accidental drags do nothing.
+* **Calm left and right.** Workspace steps need a deliberate swipe and are spaced at least
+  0.3 s apart, so a bouncy swipe never skips two workspaces.
 * **Never loses track of the overview.** It follows the overview's own `Shown` / `Hidden`
   signals, so closing it with Esc or a click is understood.
 * **Forgiving.** Four fingers drifting together mid-swipe get reported by libinput as a pinch;
@@ -54,9 +56,10 @@ Requires COSMIC Epoch 1 or later. Tested on Pop!_OS 24.04 (cosmic-comp 1.0, cosm
 ```ini
 [Service]
 Environment=CMC_FIRE_V=38        # vertical travel that always fires (about mm)
-Environment=CMC_FIRE_H=45        # horizontal travel that always fires
-Environment=CMC_FLICK_MIN=18     # a flick may fire after this much travel...
+Environment=CMC_FIRE_H=40        # horizontal travel for a workspace step
+Environment=CMC_FLICK_MIN=18     # a vertical flick may fire after this much travel...
 Environment=CMC_FLICK_SPEED=300  # ...if it is at least this fast (units per second)
+Environment=CMC_SWITCH_GAP=0.3   # minimum seconds between workspace steps
 Environment=CMC_DOMINANCE=1.3    # how clearly one direction must win
 ```
 

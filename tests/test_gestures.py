@@ -31,9 +31,12 @@ class Harness:
     def __init__(self):
         self.bus = cmc.SimBus()
         self.ran = []
-        self.det = cmc.Detector(cmc.Controller(self.bus, run=lambda *c: self.ran.append(" ".join(c))))
+        self.now = 100.0
+        self.det = cmc.Detector(cmc.Controller(self.bus, run=lambda *c: self.ran.append(" ".join(c)),
+                                               clock=lambda: self.now))
 
-    def swipe(self, dx, dy, **kw):
+    def swipe(self, dx, dy, gap=1.0, **kw):
+        self.now += gap                          # seconds since the previous gesture
         for line in lines(dx, dy, **kw):
             self.det.feed(line)
         return self.det.result
@@ -64,7 +67,7 @@ class FlowTest(unittest.TestCase):
         self.assertEqual(h.swipe(55, 0), "workspace right in overview")
         self.assertEqual(h.swipe(0, 50), "hide overview")
         self.assertEqual(h.swipe(0, 50), "app library")
-        self.assertEqual(h.bus.calls, ["Show", "Show", "Show", "Hide"])
+        self.assertEqual(h.bus.calls, ["Show", "Hide"])   # no redundant Show after a step
         self.assertEqual(h.ran, ["ydotool key super+ctrl+Left", "ydotool key super+ctrl+Right",
                                  "cosmic-app-library"])
 
@@ -115,6 +118,30 @@ class FeelTest(unittest.TestCase):
     def test_slow_full_swipe_fires(self):
         h = Harness()
         self.assertEqual(h.swipe(0, -40, duration=0.8), "show overview")
+
+    def test_sideways_flick_does_not_step(self):
+        h = Harness()
+        h.swipe(0, -50)
+        self.assertIsNone(h.swipe(-24, 0, duration=0.05))                       # quick 2 cm twitch
+        self.assertEqual(h.ran, [])
+
+    def test_deliberate_sideways_swipe_steps(self):
+        h = Harness()
+        h.swipe(0, -50)
+        self.assertEqual(h.swipe(-45, 0, duration=0.15), "workspace left in overview")
+
+    def test_bouncy_double_swipe_steps_once(self):
+        h = Harness()
+        h.swipe(0, -50)
+        h.swipe(-45, 0)
+        self.assertEqual(h.swipe(-45, 0, gap=0.15), "ignored: too soon after the last step")
+        self.assertEqual(h.ran, ["ydotool key super+ctrl+Left"])
+
+    def test_step_arms_reshow(self):
+        h = Harness()
+        h.swipe(0, -50)
+        h.swipe(45, 0)
+        self.assertAlmostEqual(h.bus.reshow_until, h.now + cmc.RESHOW_WINDOW)
 
 
 if __name__ == "__main__":
